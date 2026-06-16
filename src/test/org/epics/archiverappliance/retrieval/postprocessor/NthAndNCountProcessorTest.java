@@ -12,6 +12,7 @@ import org.epics.archiverappliance.config.ArchDBRTypes;
 import org.epics.archiverappliance.config.PVTypeInfo;
 import org.epics.archiverappliance.data.ScalarValue;
 import org.epics.archiverappliance.retrieval.CallableEventStream;
+import org.epics.archiverappliance.retrieval.ChangeInYearsException;
 import org.epics.archiverappliance.retrieval.postprocessors.NCount;
 import org.epics.archiverappliance.retrieval.postprocessors.Nth;
 import org.epics.archiverappliance.utils.simulation.SimulationEvent;
@@ -216,6 +217,63 @@ public class NthAndNCountProcessorTest {
                 Nth.MAX_COUNT,
                 eventCount,
                 "The number of events should be the truncated to the max allowed number of events");
+    }
+
+    @Test
+    public void testNthCrossYearDetection() throws Exception {
+        String nthTestPVName = "Test_NthCrossYearDetection";
+
+        Instant start = TimeUtils.convertFromISO8601String("2024-12-31T23:59:50.000Z");
+        Instant end = TimeUtils.convertFromISO8601String("2025-01-01T00:00:00.000Z");
+        YearSecondTimestamp start2024 = TimeUtils.convertToYearSecondTimestamp(start);
+        YearSecondTimestamp start2025 = TimeUtils.convertToYearSecondTimestamp(end);
+
+        PVTypeInfo pvTypeInfo = new PVTypeInfo(pvName, ArchDBRTypes.DBR_SCALAR_DOUBLE, true, 1);
+
+        double valueIn2024 = 1.0;
+        double valueIn2025 = 2.0;
+
+        ArrayListEventStream testData = new ArrayListEventStream(
+                2, new RemotableEventStreamDesc(ArchDBRTypes.DBR_SCALAR_DOUBLE, nthTestPVName, start2024.getYear()));
+
+        // Add 1 first-year event
+        testData.add(new SimulationEvent(
+                start2024.getSecondsintoyear(),
+                start2024.getYear(),
+                ArchDBRTypes.DBR_SCALAR_DOUBLE,
+                new ScalarValue<>(valueIn2024)));
+
+        // Add 1 second-year event
+        testData.add(new SimulationEvent(
+                start2025.getSecondsintoyear(),
+                start2025.getYear(),
+                ArchDBRTypes.DBR_SCALAR_DOUBLE,
+                new ScalarValue<>(valueIn2025)));
+
+        Nth nthPostProcessor = new Nth();
+        nthPostProcessor.initialize("nth_1", nthTestPVName);
+        nthPostProcessor.estimateMemoryConsumption(pvName, pvTypeInfo, start, end, null);
+
+        var callableEventStream = CallableEventStream.makeOneStreamCallable(testData, null, false);
+
+        var callable = nthPostProcessor.wrap(callableEventStream);
+
+        callable.call();
+
+        EventStream eventStream = nthPostProcessor.getConsolidatedEventStream();
+
+        // First event is in 2024 - do not trigger the ChangeInYearsException
+        Event first = eventStream.iterator().next();
+        Assertions.assertEquals(valueIn2024, first.getSampleValue().getValue());
+
+        // Second event is in 2025 - trigger the ChangeInYearsException
+        ChangeInYearsException ex = Assertions.assertThrows(
+                ChangeInYearsException.class,
+                eventStream.iterator()::next,
+                "Expected ChangeInYearsException when year changes");
+
+        Assertions.assertEquals(start2024.getYear(), ex.getPreviousYear());
+        Assertions.assertEquals(start2025.getYear(), ex.getCurrentYear());
     }
 
     /**
