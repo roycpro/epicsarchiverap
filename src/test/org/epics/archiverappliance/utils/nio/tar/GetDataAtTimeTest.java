@@ -7,6 +7,7 @@
  *******************************************************************************/
 package org.epics.archiverappliance.utils.nio.tar;
 
+import jakarta.servlet.http.HttpServletRequest;
 import org.apache.commons.io.FileUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -30,6 +31,7 @@ import org.epics.archiverappliance.utils.nio.ArchPaths;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -40,13 +42,18 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Instant;
 import java.time.Period;
+import java.time.temporal.ChronoUnit;
 import java.util.Map;
 import java.util.Random;
+
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * Test GetDataAtTime using its internal method getDataAtTimeForPVFromStores
  * We generate PVTypeInfo's for a few PVs; generate gztar data and test retrieval
  * We generate one data point per hour 11 seconds past the hour
+ *
  * @author mshankar
  *
  */
@@ -54,11 +61,11 @@ public class GetDataAtTimeTest {
     private static final Logger logger = LogManager.getLogger();
     // pvName to epochSecond multiplier for value
     private static Map<String, Integer> pvNames =
-            Map.of("epics:arch:gztartest0", 1, "epics:arch:gztartest1", 2, "epics:arch:gztartest2", 3);
+        Map.of("epics:arch:gztartest0", 1, "epics:arch:gztartest1", 2, "epics:arch:gztartest2", 3);
     private static ConfigServiceForTests configService;
     private static short year = (short) (TimeUtils.getCurrentYear() - 1);
     private static final String rootFolderStr =
-            ConfigServiceForTests.getDefaultPBTestFolder() + "/gztar/GetDataAtTimeTest";
+        ConfigServiceForTests.getDefaultPBTestFolder() + "/gztar/GetDataAtTimeTest";
 
     @BeforeAll
     public static void setUp() throws Exception {
@@ -83,33 +90,33 @@ public class GetDataAtTimeTest {
         assert pvPath.getParent().toFile().mkdirs();
 
         String pluginURI = plugin + "://localhost?name=XLTS&rootFolder="
-                + URLEncoder.encode(ArchPaths.TAR_SCHEME + "://" + rootFolderStr, "UTF-8")
-                + "&partitionGranularity=PARTITION_DAY";
+            + URLEncoder.encode(ArchPaths.TAR_SCHEME + "://" + rootFolderStr, "UTF-8")
+            + "&partitionGranularity=PARTITION_DAY";
         StoragePlugin storagePlugin = StoragePluginURLParser.parseStoragePlugin(pluginURI, configService);
 
         for (String pvName : pvNames.keySet()) {
             try (BasicContext context = new BasicContext()) {
                 for (int day = 0; day < 365; day++) {
                     ArrayListEventStream testData = new ArrayListEventStream(
-                            24 * 60 * 60, new RemotableEventStreamDesc(ArchDBRTypes.DBR_SCALAR_DOUBLE, pvName, year));
+                        24 * 60 * 60, new RemotableEventStreamDesc(ArchDBRTypes.DBR_SCALAR_DOUBLE, pvName, year));
                     int startofdayinseconds = day * 24 * 60 * 60;
                     for (int secondintoday = 11; secondintoday < 24 * 60 * 60; secondintoday += 3600) {
                         Instant dataTs = TimeUtils.convertFromYearSecondTimestamp(
-                                new YearSecondTimestamp(year, startofdayinseconds + secondintoday, 0));
+                            new YearSecondTimestamp(year, startofdayinseconds + secondintoday, 0));
                         testData.add(new POJOEvent(
-                                        ArchDBRTypes.DBR_SCALAR_DOUBLE,
-                                        dataTs,
-                                        new ScalarValue<Long>(dataTs.getEpochSecond() * pvNames.get(pvName)),
-                                        0,
-                                        0)
-                                .makeClone());
+                            ArchDBRTypes.DBR_SCALAR_DOUBLE,
+                            dataTs,
+                            new ScalarValue<Long>(dataTs.getEpochSecond() * pvNames.get(pvName)),
+                            0,
+                            0)
+                            .makeClone());
                     }
                     storagePlugin.appendData(context, pvName, testData);
                 }
             }
             try {
                 PVTypeInfo typeInfo = new PVTypeInfo(pvName, ArchDBRTypes.DBR_SCALAR_DOUBLE, true, 1);
-                String[] dataStores = new String[] {pluginURI};
+                String[] dataStores = new String[]{pluginURI};
                 typeInfo.setDataStores(dataStores);
                 typeInfo.setApplianceIdentity(configService.getMyApplianceInfo().getIdentity());
                 configService.updateTypeInfoForPV(pvName, typeInfo);
@@ -120,9 +127,35 @@ public class GetDataAtTimeTest {
         }
     }
 
+    /**
+     * Test static property helpers on GetDataAtTime directly.
+     */
+    @Test
+    public void testConfigPropertyParsing() throws Exception {
+        ConfigServiceForTests localConfigService = new ConfigServiceForTests(1);
+
+        // Default setup: enable = true, searchPeriod = null
+        Assertions.assertTrue(GetDataAtTime.isGetDataAtTimeDefaultEnabled(localConfigService));
+        Assertions.assertNull(GetDataAtTime.getGetDataAtTimeDefaultSearchPeriod(localConfigService));
+
+        // Disable defaults
+        localConfigService.getInstallationProperties()
+            .setProperty("org.epics.archiverappliance.retrieval.getDataAtTime.default.enable", "false");
+        Assertions.assertFalse(GetDataAtTime.isGetDataAtTimeDefaultEnabled(localConfigService));
+
+        // Enable custom searchPeriod
+        localConfigService.getInstallationProperties()
+            .setProperty("org.epics.archiverappliance.retrieval.getDataAtTime.default.enable", "true");
+        localConfigService.getInstallationProperties()
+            .setProperty("org.epics.archiverappliance.retrieval.getDataAtTime.default.searchPeriod", "P1Y");
+
+        Assertions.assertTrue(GetDataAtTime.isGetDataAtTimeDefaultEnabled(localConfigService));
+        Assertions.assertEquals(Period.parse("P1Y"), GetDataAtTime.getGetDataAtTimeDefaultSearchPeriod(localConfigService));
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"pb", "parquet"})
-    public void testGetDataAtTime(String plugin) throws Exception {
+    public void testGetDataAtTimeExplicitPeriod(String plugin) throws Exception {
         createTestData(plugin);
 
         Period searchPeriod = Period.parse("P1D");
@@ -130,37 +163,120 @@ public class GetDataAtTimeTest {
         for (int day = 1; day < 365; day += 60) {
             int startofdayinseconds = day * 24 * 60 * 60;
             Instant dataTs = TimeUtils.convertFromYearSecondTimestamp(
-                    new YearSecondTimestamp(year, startofdayinseconds + random.nextInt(86400 - 1), 0));
+                new YearSecondTimestamp(year, startofdayinseconds + random.nextInt(86400 - 1), 0));
             logger.debug(
-                    "Looking for data at {} epoch {}",
-                    TimeUtils.convertToHumanReadableString(dataTs),
-                    dataTs.getEpochSecond());
+                "Looking for data at {} epoch {}",
+                TimeUtils.convertToHumanReadableString(dataTs),
+                dataTs.getEpochSecond());
             try (BasicContext context = new BasicContext()) {
                 for (String pvName : pvNames.keySet()) {
                     PVWithData pvDatas =
-                            GetDataAtTime.getDataAtTimeForPVFromStores(pvName, dataTs, searchPeriod, configService);
+                        GetDataAtTime.getDataAtTimeForPVFromStores(pvName, dataTs, searchPeriod, configService);
                     DBRTimeEvent event = (DBRTimeEvent) pvDatas.event();
                     Assertions.assertNotNull(
-                            event, "Getting at time " + dataTs + " for PV " + pvName + " returns null?");
+                        event, "Getting at time " + dataTs + " for PV " + pvName + " returns null?");
                     logger.info(
-                            "pvDatas for {} is {}",
-                            pvDatas.pvName(),
-                            TimeUtils.convertToHumanReadableString(event.getEventTimeStamp()));
+                        "pvDatas for {} is {}",
+                        pvDatas.pvName(),
+                        TimeUtils.convertToHumanReadableString(event.getEventTimeStamp()));
                     Assertions.assertTrue(
-                            Math.abs((event.getEventTimeStamp().getEpochSecond() - dataTs.getEpochSecond())) <= 7200,
-                            "Expected a sample on or after " + (dataTs.getEpochSecond() - 7200) + " got "
-                                    + event.getEventTimeStamp().getEpochSecond());
+                        Math.abs((event.getEventTimeStamp().getEpochSecond() - dataTs.getEpochSecond())) <= 7200,
+                        "Expected a sample on or after " + (dataTs.getEpochSecond() - 7200) + " got "
+                            + event.getEventTimeStamp().getEpochSecond());
                     Assertions.assertTrue(
-                            ((double) event.getEventTimeStamp().getEpochSecond() * pvNames.get(pvName))
-                                    == ((double)
-                                            event.getSampleValue().getValue().doubleValue()),
-                            "Expected value "
-                                    + ((double) event.getEventTimeStamp().getEpochSecond() * pvNames.get(pvName))
-                                    + " got "
-                                    + ((double)
-                                            event.getSampleValue().getValue().doubleValue()));
+                        ((double) event.getEventTimeStamp().getEpochSecond() * pvNames.get(pvName))
+                            == ((double)
+                            event.getSampleValue().getValue().doubleValue()),
+                        "Expected value "
+                            + ((double) event.getEventTimeStamp().getEpochSecond() * pvNames.get(pvName))
+                            + " got "
+                            + ((double)
+                            event.getSampleValue().getValue().doubleValue()));
                 }
             }
+        }
+    }
+
+    /**
+     * Scenario: enable = false => data is NOT null.
+     * When default searchPeriod capping is disabled (searchPeriod = null), queries past bounded ranges
+     * still traverse history infinitely and return valid data.
+     */
+    @Test
+    public void testIntegrationDefaultDisabled_ReturnsDataNotNull() throws Exception {
+        createTestData("parquet");
+
+        ConfigServiceForTests localConfig = new ConfigServiceForTests(1);
+        localConfig.getInstallationProperties()
+            .setProperty("org.epics.archiverappliance.retrieval.getDataAtTime.default.enable", "false");
+
+        HttpServletRequest req = mock(HttpServletRequest.class);
+        when(req.getParameter("searchPeriod")).thenReturn(null);
+
+        // Request time is 60 days after stored data ends
+        Instant farFutureTime = TimeUtils.convertFromYearSecondTimestamp(
+            new YearSecondTimestamp(year, (364 * 24 * 60 * 60) + 1200, 0)).plus(60, ChronoUnit.DAYS);
+
+        for (String pvName : pvNames.keySet()) {
+            PVWithData result = GetDataAtTime.getDataAtTimeForPVFromStores(pvName, farFutureTime, null, configService);
+            Assertions.assertNotNull(result, "enable=false without searchPeriod should return non-null PVWithData");
+            Assertions.assertNotNull(result.event(),
+                "enable=false without searchPeriod should return non-null event for " + pvName);
+        }
+    }
+
+    /**
+     * Scenario: enable = true => data is NOT null.
+     * When default searchPeriod is enabled (P1D) and the sample falls within 1 day of query time.
+     */
+    @Test
+    public void testIntegrationDefaultEnabled_DataWithinRange_ReturnsDataNotNull() throws Exception {
+        createTestData("parquet");
+
+        ConfigServiceForTests localConfig = new ConfigServiceForTests(1);
+        localConfig.getInstallationProperties()
+            .setProperty("org.epics.archiverappliance.retrieval.getDataAtTime.default.enable", "true");
+
+        HttpServletRequest req = mock(HttpServletRequest.class);
+        when(req.getParameter("searchPeriod")).thenReturn(null);
+
+        Period effectivePeriod = Period.parse("P1D");
+
+        // Target day 100 at 12:00 UTC
+        Instant targetTime = TimeUtils.convertFromYearSecondTimestamp(
+            new YearSecondTimestamp(year, 100 * 24 * 60 * 60 + 1200, 0));
+
+        for (String pvName : pvNames.keySet()) {
+            PVWithData result = GetDataAtTime.getDataAtTimeForPVFromStores(pvName, targetTime, effectivePeriod, configService);
+            Assertions.assertNotNull(result, "enable=true with data in range should return non-null PVWithData");
+            Assertions.assertNotNull(result.event(), "enable=true with data in range should return non-null event for " + pvName);
+        }
+    }
+
+    /**
+     * Scenario: enable = true => data IS null.
+     * Happens when querying a time where no data exists within the effective searchPeriod window (P1D).
+     */
+    @Test
+    public void testIntegrationDefaultEnabled_DataOutOfRange_ReturnsDataNull() throws Exception {
+        createTestData("parquet");
+
+        ConfigServiceForTests localConfig = new ConfigServiceForTests(1);
+        localConfig.getInstallationProperties()
+            .setProperty("org.epics.archiverappliance.retrieval.getDataAtTime.default.enable", "true");
+
+        HttpServletRequest req = mock(HttpServletRequest.class);
+        when(req.getParameter("searchPeriod")).thenReturn(null);
+
+        Period effectivePeriod = Period.parse("P1D");
+
+        // Query time is 60 days after the last data sample (outside the 1-day searchPeriod window)
+        Instant farFutureTime = TimeUtils.convertFromYearSecondTimestamp(
+            new YearSecondTimestamp(year, (364 * 24 * 60 * 60) + 1200, 0)).plus(60, ChronoUnit.DAYS);
+
+        for (String pvName : pvNames.keySet()) {
+            PVWithData result = GetDataAtTime.getDataAtTimeForPVFromStores(pvName, farFutureTime, effectivePeriod, configService);
+            Assertions.assertNull(result, "enable=true with NO data within searchPeriod should return null for " + pvName);
         }
     }
 }

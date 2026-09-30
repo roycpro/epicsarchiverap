@@ -87,11 +87,19 @@ public class GetDataAtTime {
             HashSet<String> remainingPVs = new HashSet<String>(gatherer.pvsFromAppliance);
             // We only has for PVs that we do not already have the answer for.
             remainingPVs.removeAll(gatherer.pvValues.keySet());
+
+            StringBuilder targetUrl = new StringBuilder(gatherer.applianceInfo.getRetrievalURL())
+                .append("/../data/getDataAtTimeForAppliance?at=")
+                .append(TimeUtils.convertToISO8601String(atTime));
+
+            if (searchPeriod != null) {
+                targetUrl.append("&searchPeriod=").append(searchPeriod.toString());
+            }
+
             HashMap<String, HashMap<String, Object>> resp = GetUrlContent.postStringListAndGetJSON(
-                    gatherer.applianceInfo.getRetrievalURL() + "/../data/getDataAtTimeForAppliance?at="
-                            + TimeUtils.convertToISO8601String(atTime) + "&searchPeriod=" + searchPeriod.toString(),
-                    "pv",
-                    remainingPVs);
+                targetUrl.toString(),
+                "pv",
+                remainingPVs);
             if (resp == null) return gatherer;
             logger.debug(
                     "Done calling retrieval for appliance {} with PVs {} and got data for {}",
@@ -178,10 +186,19 @@ public class GetDataAtTime {
                 req.getParameter("includeProxies") != null && Boolean.parseBoolean(req.getParameter("includeProxies"));
 
         String searchPeriodStr = req.getParameter("searchPeriod");
-        if (searchPeriodStr == null) {
-            searchPeriodStr = "P1D";
+        Period searchPeriod = null;
+        if (searchPeriodStr != null) {
+            searchPeriod = Period.parse(searchPeriodStr);
+        } else {
+            if (isGetDataAtTimeDefaultEnabled(configService)) {
+                Period configuredDefault = getGetDataAtTimeDefaultSearchPeriod(configService);
+                if (configuredDefault != null) {
+                    searchPeriod = configuredDefault;
+                } else {
+                    searchPeriod = Period.parse("P1D");
+                }
+            }
         }
-        Period searchPeriod = Period.parse(searchPeriodStr);
 
         pmansProfiler.mark("After request params.");
 
@@ -256,8 +273,10 @@ public class GetDataAtTime {
         List<CompletableFuture<Appliance2PVs>> retrievalCalls = new LinkedList<>();
         for (ApplianceInfo applianceInfo : configService.getAppliancesInCluster()) {
             try {
+                final Period finalSearchPeriod = searchPeriod;
                 retrievalCalls.add(CompletableFuture.supplyAsync(() ->
-                        getDataFromRetrieval(valuesGatherer.get(applianceInfo.getIdentity()), atTime, searchPeriod)));
+                        getDataFromRetrieval(valuesGatherer.get(applianceInfo.getIdentity()), atTime,
+                            finalSearchPeriod)));
             } catch (Throwable t) {
                 logger.error("Exception adding completable future", t);
             }
@@ -364,12 +383,13 @@ public class GetDataAtTime {
                         // should stop at the specified time period.
 
                         Instant startAtTime = atTime.plus(5, ChronoUnit.MINUTES);
+                        Period effectivePeriod = (searchPeriod != null) ? searchPeriod.plusDays(31) : null;
                         Event e = dataAtTimePlugin.dataAtTime(
                                 context,
                                 pvName,
                                 atTime,
                                 startAtTime,
-                                searchPeriod.plusDays(31),
+                                effectivePeriod,
                                 BiDirectionalIterable.IterationDirection.BACKWARDS);
                         if (e != null) {
                             return new PVWithData(pvName, e);
@@ -402,18 +422,27 @@ public class GetDataAtTime {
         }
         Instant atTime = TimeUtils.convertFromISO8601String(timeStr);
         String searchPeriodStr = req.getParameter("searchPeriod");
-        if (searchPeriodStr == null) {
-            searchPeriodStr = "P1D";
+        Period searchPeriod = null;
+        if (searchPeriodStr != null) {
+            searchPeriod = Period.parse(searchPeriodStr);
+        } else {
+            if (isGetDataAtTimeDefaultEnabled(configService)) {
+                Period configuredDefault = getGetDataAtTimeDefaultSearchPeriod(configService);
+                if (configuredDefault != null) {
+                    searchPeriod = configuredDefault;
+                } else {
+                    searchPeriod = Period.parse("P1D");
+                }
+            }
         }
-        Period searchPeriod = Period.parse(searchPeriodStr);
-
         logger.debug("Getting data from instance for " + pvNames.size() + " PVs at "
                 + TimeUtils.convertToHumanReadableString(atTime));
 
         List<CompletableFuture<PVWithData>> retrievalCalls = new LinkedList<>();
         for (String pvName : pvNames) {
+            final Period finalSearchPeriod = searchPeriod;
             retrievalCalls.add(CompletableFuture.supplyAsync(
-                    () -> getDataAtTimeForPVFromStores(pvName, atTime, searchPeriod, configService)));
+                    () -> getDataAtTimeForPVFromStores(pvName, atTime, finalSearchPeriod, configService)));
         }
 
         CompletableFuture.allOf(toArray(retrievalCalls)).join();
@@ -430,5 +459,21 @@ public class GetDataAtTime {
         } catch (Exception ex) {
             logger.error("Exception converting samples to JSON", ex);
         }
+    }
+
+    public static boolean isGetDataAtTimeDefaultEnabled(ConfigService configService) {
+        return Boolean.parseBoolean(
+            configService.getInstallationProperties()
+                .getProperty("org.epics.archiverappliance.retrieval.getDataAtTime.default.enable",
+                    "true"));
+    }
+
+    public static Period getGetDataAtTimeDefaultSearchPeriod(ConfigService configService) {
+        String val = configService.getInstallationProperties()
+            .getProperty("org.epics.archiverappliance.retrieval.getDataAtTime.default.searchPeriod", null);
+        if (val != null && !val.trim().isEmpty()) {
+            return Period.parse(val.trim());
+        }
+        return null;
     }
 }
